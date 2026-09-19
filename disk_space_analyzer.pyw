@@ -35,16 +35,25 @@ def fmt_size(n):
 
 def open_location(path):
     """在资源管理器中打开并选中 path（文件夹则直接打开）。"""
-    try:
-        if os.path.isdir(path):
-            subprocess.Popen(["explorer", os.path.normpath(path)])
-        else:
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
-    except Exception:
+    path = os.path.normpath(path)
+    if os.path.isdir(path):
+        # 文件夹：直接用系统默认方式打开（最可靠）
         try:
-            os.startfile(os.path.dirname(path))
+            os.startfile(path)
+            return
         except Exception:
             pass
+    # 文件：在资源管理器中定位并选中
+    try:
+        subprocess.Popen(["explorer", "/select,", path])
+        return
+    except Exception:
+        pass
+    # 兜底：打开所在目录
+    try:
+        os.startfile(os.path.dirname(path))
+    except Exception:
+        pass
 
 
 class SHFILEOPSTRUCTW(ctypes.Structure):
@@ -206,6 +215,9 @@ class App:
         self.top_files = []
         self._rects = []  # [(node, x, y, w, h)]
         self._hover = None
+        self._history = []  # 下钻历史栈，元素为 (node)
+        self._selected_path = None  # 当前选中的列表项路径
+        self._node_index = {}  # 规范化路径 -> 节点，用于瞬间跳转任意祖先目录
 
         self._build_ui()
         self._poll()
@@ -234,78 +246,50 @@ class App:
         self.scan_btn.pack(side="left", padx=2)
         self.stop_btn = ttk.Button(bar, text="停止", command=self.stop_scan, state="disabled")
         self.stop_btn.pack(side="left", padx=2)
-        self.back_btn = ttk.Button(bar, text="上级", command=self.go_up, state="disabled")
+
+        # 导航工具栏（第二行）
+        nav = ttk.Frame(self.root, padding=(8, 0, 8, 6))
+        nav.pack(side="top", fill="x")
+        self.back_btn = ttk.Button(nav, text="◀ 返回上级", width=10,
+                                   command=self.go_up, state="disabled")
         self.back_btn.pack(side="left", padx=2)
-        self.root_btn = ttk.Button(bar, text="根目录", command=self.go_root, state="disabled")
+        self.root_btn = ttk.Button(nav, text="⌂ 回到根目录", width=11,
+                                   command=self.go_root, state="disabled")
         self.root_btn.pack(side="left", padx=2)
+        self.open_btn = ttk.Button(nav, text="📂 打开当前位置", width=13,
+                                   command=self._open_current_folder, state="disabled")
+        self.open_btn.pack(side="left", padx=2)
+        self.copy_btn = ttk.Button(nav, text="📋 复制路径", width=10,
+                                   command=self._copy_current_folder, state="disabled")
+        self.copy_btn.pack(side="left", padx=2)
+        self.refresh_btn = ttk.Button(nav, text="⟳ 刷新", width=8,
+                                      command=self._refresh_current, state="disabled")
+        self.refresh_btn.pack(side="left", padx=2)
+        self.top_btn = ttk.Button(nav, text="📊 最大文件", width=12,
+                                  command=self._show_top_files, state="disabled")
+        self.top_btn.pack(side="left", padx=2)
 
         # 状态栏
         self.status_var = tk.StringVar(value="请选择盘符或文件夹后点击“扫描”")
         ttk.Label(self.root, textvariable=self.status_var, anchor="w",
                   padding=(8, 2)).pack(side="bottom", fill="x")
 
-        # 主体：左树图 + 右标签页
-        paned = ttk.PanedWindow(self.root, orient="horizontal")
-        paned.pack(side="top", fill="both", expand=True)
-
-        left = ttk.Frame(paned)
-        paned.add(left, weight=3)
+        # 主体：可视化树图铺满整个窗口
         self.breadcrumb = tk.StringVar(value="")
-        ttk.Label(left, textvariable=self.breadcrumb, anchor="w", padding=(6, 2)).pack(fill="x")
-        self.canvas = tk.Canvas(left, bg="#f2f2f2", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
+        ttk.Label(self.root, textvariable=self.breadcrumb, anchor="w",
+                  padding=(8, 2)).pack(side="top", fill="x")
+        self.canvas = tk.Canvas(self.root, bg="#f2f2f2", highlightthickness=0)
+        self.canvas.pack(side="top", fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda e: self._draw())
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<Motion>", self._on_move)
         self.canvas.bind("<Leave>", lambda e: self._set_hover(None))
         self.canvas.bind("<Button-3>", self._on_right_click)
 
-        right = ttk.Frame(paned)
-        paned.add(right, weight=2)
-        nb = ttk.Notebook(right)
-        nb.pack(fill="both", expand=True)
-
-        # 文件夹标签
-        ftab = ttk.Frame(nb)
-        nb.add(ftab, text="文件夹")
-        self.folder_tree = ttk.Treeview(ftab, columns=("size", "type"), show="tree headings")
-        self.folder_tree.heading("#0", text="名称", anchor="w")
-        self.folder_tree.heading("size", text="大小", anchor="w")
-        self.folder_tree.heading("type", text="类型", anchor="w")
-        self.folder_tree.column("#0", width=180, stretch=True)
-        self.folder_tree.column("size", width=90, anchor="e", stretch=False)
-        self.folder_tree.column("type", width=70, anchor="w", stretch=False)
-        vsb = ttk.Scrollbar(ftab, orient="vertical", command=self.folder_tree.yview)
-        self.folder_tree.configure(yscrollcommand=vsb.set)
-        self.folder_tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="left", fill="y")
-        self.folder_tree.bind("<Double-1>", self._on_folder_double)
-
-        # 最大文件标签
-        ftab2 = ttk.Frame(nb)
-        nb.add(ftab2, text="最大文件")
-        self.file_tree = ttk.Treeview(ftab2, columns=("size", "path"), show="tree headings")
-        self.file_tree.heading("#0", text="文件", anchor="w")
-        self.file_tree.heading("size", text="大小", anchor="w")
-        self.file_tree.heading("path", text="完整路径", anchor="w")
-        self.file_tree.column("#0", width=150, stretch=False)
-        self.file_tree.column("size", width=90, anchor="e", stretch=False)
-        self.file_tree.column("path", width=400, anchor="w", stretch=True)
-        vsb2 = ttk.Scrollbar(ftab2, orient="vertical", command=self.file_tree.yview)
-        self.file_tree.configure(yscrollcommand=vsb2.set)
-        self.file_tree.pack(side="left", fill="both", expand=True)
-        vsb2.pack(side="left", fill="y")
-        self.file_tree.bind("<Double-1>", self._on_file_double)
-
-        # 操作按钮
-        act = ttk.Frame(right, padding=(6, 6))
-        act.pack(fill="x")
-        ttk.Button(act, text="打开位置", command=self._open_selected).pack(side="left", padx=2)
-        ttk.Button(act, text="删除到回收站", command=self._delete_selected).pack(side="left", padx=2)
-        ttk.Button(act, text="刷新当前目录", command=self._refresh_current).pack(side="left", padx=2)
-
         self._menu = tk.Menu(self.root, tearoff=0)
+        self._menu.add_command(label="复制完整路径", command=self._copy_selected)
         self._menu.add_command(label="打开所在位置", command=self._open_selected)
+        self._menu.add_separator()
         self._menu.add_command(label="删除到回收站", command=self._delete_selected)
 
     def _list_drives(self):
@@ -362,10 +346,11 @@ class App:
                     self.root_node = root_node
                     self.current = root_node
                     self.top_files = top_files
+                    self._history.clear()
+                    self._index_tree(root_node)
                     self.scan_btn.config(state="normal")
                     self.stop_btn.config(state="disabled")
-                    self.back_btn.config(state="disabled")
-                    self.root_btn.config(state="disabled")
+                    self._update_nav_buttons()
                     self.status_var.set("完成：%s 共 %s" % (root_node.path, fmt_size(root_node.size)))
                     self._refresh_views()
                 elif kind == "cancelled":
@@ -384,27 +369,25 @@ class App:
 
     # ------------------------- 视图刷新 -------------------------
     def _refresh_views(self):
-        self._refresh_folder_table()
-        self._refresh_file_table()
+        self._update_breadcrumb()
         self._draw()
+        if getattr(self, "_topfiles_win", None) and self._topfiles_win.winfo_exists():
+            self._refresh_file_table()
 
-    def _refresh_folder_table(self):
-        self.folder_tree.delete(*self.folder_tree.get_children())
+    def _update_breadcrumb(self):
         if not self.current:
             return
-        self.breadcrumb.set(self.current.path)
-        children = sorted(self.current.children or [], key=lambda c: -c.size)
-        for c in children:
-            kind = "文件夹" if c.is_dir else "文件"
-            self.folder_tree.insert(
-                "", "end", text=c.name, values=(fmt_size(c.size), kind),
-                tags=(c.path,)
-            )
+        n_dir = sum(1 for c in (self.current.children or []) if c.is_dir)
+        n_file = sum(1 for c in (self.current.children or []) if not c.is_dir)
+        self.breadcrumb.set("%s    [总计 %s · %d 个子目录 · %d 个文件]" % (
+            self.current.path, fmt_size(self.current.size), n_dir, n_file))
 
     def _refresh_file_table(self):
-        self.file_tree.delete(*self.file_tree.get_children())
+        if not getattr(self, "_file_tree", None):
+            return
+        self._file_tree.delete(*self._file_tree.get_children())
         for size, path in self.top_files:
-            self.file_tree.insert(
+            self._file_tree.insert(
                 "", "end", text=os.path.basename(path),
                 values=(fmt_size(size), path), tags=(path,)
             )
@@ -430,10 +413,15 @@ class App:
             if not c.is_dir:
                 color = "#c9c9c9"
             self.canvas.create_rectangle(x, y, x + rw, y + rh, fill=color, outline="white")
-            if rw > 60 and rh > 20:
-                label = c.name if len(c.name) < 30 else c.name[:28] + ".."
+            if rw > 55 and rh > 18:
+                name = c.name if len(c.name) < 26 else c.name[:24] + ".."
+                size_text = fmt_size(c.size)
+                if rh > 40:
+                    label = name + "\n" + size_text
+                else:
+                    label = name + "  " + size_text
                 self.canvas.create_text(x + rw / 2, y + rh / 2, text=label,
-                                        fill="white", font=("Segoe UI", 9))
+                                        fill="white", font=("Segoe UI", 8), justify="center")
             self._rects.append((c, x, y, rw, rh))
 
     def _hit(self, ex, ey):
@@ -447,10 +435,7 @@ class App:
         if not node:
             return
         if node.is_dir:
-            self.current = node
-            self.back_btn.config(state="normal")
-            self.root_btn.config(state="normal")
-            self._refresh_views()
+            self._descend(node)
         else:
             open_location(node.path)
 
@@ -463,9 +448,10 @@ class App:
 
     def _set_hover(self, node):
         if node is None:
-            self.breadcrumb.set(self.current.path if self.current else "")
+            self._update_breadcrumb()
         else:
-            self.breadcrumb.set("%s  |  %s" % (fmt_size(node.size), node.path))
+            kind = "文件夹" if node.is_dir else "文件"
+            self.breadcrumb.set("▶ %s  %s  |  %s" % (kind, fmt_size(node.size), node.path))
 
     def _on_right_click(self, event):
         node = self._hit(event.x, event.y)
@@ -474,39 +460,141 @@ class App:
             self._menu.tk_popup(event.x_root, event.y_root)
 
     # ------------------------- 导航与操作 -------------------------
-    def go_up(self):
+    def _index_tree(self, node):
+        """把整棵树按路径建索引，用于瞬间跳转到任意祖先目录。"""
+        self._node_index.clear()
+
+        def walk(n):
+            self._node_index[os.path.normpath(n.path)] = n
+            for c in (n.children or []):
+                if c.is_dir:
+                    walk(c)
+
+        walk(node)
+
+    def _parent_of(self, node):
+        if not node:
+            return None
+        parent = os.path.dirname(os.path.normpath(node.path).rstrip("\\/"))
+        return self._node_index.get(os.path.normpath(parent)) if parent else None
+
+    def _update_nav_buttons(self):
+        ready = self.current is not None
+        can_up = bool(self._history) or self._parent_of(self.current) is not None
+        self.back_btn.config(state="normal" if can_up else "disabled")
+        self.root_btn.config(state="normal" if self.root_node is not None else "disabled")
+        self.open_btn.config(state="normal" if ready else "disabled")
+        self.copy_btn.config(state="normal" if ready else "disabled")
+        self.refresh_btn.config(state="normal" if ready else "disabled")
+        self.top_btn.config(state="normal" if ready else "disabled")
+
+    def _descend(self, node):
+        """下钻到已扫描好的子目录节点，无需重新扫描。"""
         if self.current:
-            parent = os.path.dirname(self.current.path.rstrip("\\/"))
-            if parent and os.path.exists(parent):
-                self._rescan_to(parent)
+            self._history.append(self.current)
+        self.current = node
+        self._update_nav_buttons()
+        self._refresh_views()
+
+    def go_up(self):
+        if not self.current:
+            return
+        if self._history:
+            self.current = self._history.pop()
+        else:
+            parent = self._parent_of(self.current)
+            if parent is None:
+                return
+            self.current = parent
+        self._update_nav_buttons()
+        self._refresh_views()
 
     def go_root(self):
         if self.root_node:
+            self._history.clear()
             self.current = self.root_node
-            self.back_btn.config(state="disabled")
-            self.root_btn.config(state="disabled")
+            self._update_nav_buttons()
             self._refresh_views()
 
-    def _on_folder_double(self, event):
-        sel = self.folder_tree.selection()
-        if not sel:
-            return
-        path = self.folder_tree.item(sel[0], "tags")[0]
-        if os.path.isdir(path):
-            self._rescan_to(path)
+    def _open_current_folder(self):
+        """直接打开当前可视化目录（无需选中任何东西）。"""
+        if self.current and os.path.isdir(self.current.path):
+            open_location(self.current.path)
+
+    def _copy_text(self, text, what="路径"):
+        """把文本写入 Windows 剪贴板。"""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+            self.status_var.set("已复制%s：%s" % (what, text))
+            return True
+        except Exception as e:
+            self.status_var.set("复制失败：%s" % e)
+            return False
+
+    def _copy_current_folder(self):
+        """复制当前可视化目录的路径。"""
+        if self.current:
+            self._copy_text(self.current.path, "目录路径")
+
+    def _copy_selected(self):
+        """复制当前选中项（右键方块 / 弹窗列表）的完整路径。"""
+        p = self._selected_item()
+        if p:
+            self._copy_text(p)
         else:
-            open_location(path)
+            messagebox.showinfo("提示", "请在矩形图上右键，或先在“最大文件”窗口里选中一项")
+
+    def _show_top_files(self):
+        """弹出独立的“最大文件”窗口。"""
+        if getattr(self, "_topfiles_win", None) and self._topfiles_win.winfo_exists():
+            self._topfiles_win.lift()
+            self._topfiles_win.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        self._topfiles_win = win
+        win.title("最大文件 - %s" % (self.root_node.path if self.root_node else ""))
+        win.geometry("1000x600")
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True)
+        self._file_tree = ttk.Treeview(frame, columns=("size", "path"), show="tree headings")
+        self._file_tree.heading("#0", text="文件", anchor="w")
+        self._file_tree.heading("size", text="大小", anchor="w")
+        self._file_tree.heading("path", text="完整路径", anchor="w")
+        self._file_tree.column("#0", width=220, stretch=False)
+        self._file_tree.column("size", width=100, anchor="e", stretch=False)
+        self._file_tree.column("path", width=640, anchor="w", stretch=True)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self._file_tree.yview)
+        self._file_tree.configure(yscrollcommand=vsb.set)
+        self._file_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+        self._file_tree.bind("<Double-1>", self._on_file_double)
+        self._file_tree.bind("<<TreeviewSelect>>", self._on_file_select)
+
+        act = ttk.Frame(win, padding=(8, 6))
+        act.pack(fill="x")
+        ttk.Button(act, text="复制完整路径",
+                   command=self._copy_selected).pack(side="left", padx=3)
+        ttk.Button(act, text="打开所在位置",
+                   command=self._open_selected).pack(side="left", padx=3)
+        ttk.Button(act, text="删除到回收站",
+                   command=self._delete_selected).pack(side="left", padx=3)
+        ttk.Label(act, text="（双击直接定位文件）",
+                  foreground="#888").pack(side="left", padx=8)
+
+        self._refresh_file_table()
+
+    def _on_file_select(self, event):
+        sel = self._file_tree.selection()
+        if sel:
+            self._selected_path = self._file_tree.item(sel[0], "tags")[0]
 
     def _on_file_double(self, event):
-        sel = self.file_tree.selection()
+        sel = self._file_tree.selection()
         if sel:
-            open_location(self.file_tree.item(sel[0], "tags")[0])
-
-    def _rescan_to(self, path):
-        if not os.path.isdir(path):
-            return
-        self.path_var.set(path)
-        self.start_scan(path)
+            open_location(self._file_tree.item(sel[0], "tags")[0])
 
     def _refresh_current(self):
         if self.current:
@@ -514,25 +602,19 @@ class App:
 
     def _selected_item(self):
         """返回当前选中列表项对应的路径。"""
-        focus = self.root.focus_get()
-        if focus is self.folder_tree:
-            sel = self.folder_tree.selection()
-            if sel:
-                return self.folder_tree.item(sel[0], "tags")[0]
-        elif focus is self.file_tree:
-            sel = self.file_tree.selection()
-            if sel:
-                return self.file_tree.item(sel[0], "tags")[0]
-        return getattr(self, "_selected_path", None)
+        return self._selected_path
 
     def _open_selected(self):
         p = self._selected_item()
         if p and os.path.exists(p):
             open_location(p)
+        else:
+            messagebox.showinfo("提示", "请在矩形图上右键，或在“最大文件”窗口里选中一项")
 
     def _delete_selected(self):
         p = self._selected_item()
         if not p or not os.path.exists(p):
+            messagebox.showinfo("提示", "请在矩形图上右键，或先在“最大文件”窗口里选中一项")
             return
         if not messagebox.askyesno("确认删除", "删除到回收站？\n\n%s" % p):
             return
@@ -548,8 +630,10 @@ class App:
             self.status_var.set("已删除到回收站：" + path)
         else:
             self.status_var.set("删除失败：" + path)
+        # 重新扫描当前目录以刷新大小（保留当前位置）
         if self.current:
-            self._refresh_current()
+            cur = self.current.path
+            self.start_scan(cur)
 
 
 def main():
